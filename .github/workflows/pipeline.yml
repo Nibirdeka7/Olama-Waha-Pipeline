@@ -17,17 +17,18 @@ jobs:
         with:
           node-version: 20
 
-      # 1. Decrypt GPG session archive
+      # 1. Decrypt and restore WAHA session
       - name: Decrypt & Restore WAHA Session
         run: |
           mkdir -p waha_sessions
           gpg --quiet --batch --yes --decrypt --passphrase "${{ secrets.SESSION_PASSPHRASE }}" \
             --output session.tar.gz waha_session.enc
           tar -xzf session.tar.gz -C waha_sessions
+          chmod -R 777 waha_sessions
           echo "Session files unpacked:"
-          ls -la waha_sessions
+          find waha_sessions -maxdepth 2
 
-      # 2. Boot WAHA Docker Container with WEBJS engine
+      # 2. Boot WAHA Docker & Start Session Explicitly
       - name: Start WAHA Docker Service
         run: |
           docker run -d \
@@ -38,12 +39,23 @@ jobs:
             -e WHATSAPP_DEFAULT_ENGINE=WEBJS \
             devlikeapro/waha
 
-          echo "Waiting for WAHA session to reach WORKING state..."
-          for i in {1..35}; do
-            STATUS=$(curl -s -H "X-Api-Key: ${{ secrets.WAHA_API_KEY }}" http://localhost:3000/api/sessions/default | grep -o '"status":"[^"]*"' || true)
-            echo "Check $i: $STATUS"
-            if [[ "$STATUS" == *"WORKING"* ]]; then
-              echo "WAHA is online and authenticated!"
+          echo "Waiting for WAHA HTTP service..."
+          until curl -s http://localhost:3000/api/server/version > /dev/null; do
+            sleep 2
+          done
+
+          echo "Starting default session..."
+          curl -s -X POST "http://localhost:3000/api/sessions/start" \
+            -H "Content-Type: application/json" \
+            -H "X-Api-Key: ${{ secrets.WAHA_API_KEY }}" \
+            -d '{"name": "default"}' || true
+
+          echo "Polling session status until WORKING..."
+          for i in {1..40}; do
+            STATUS=$(curl -s -H "X-Api-Key: ${{ secrets.WAHA_API_KEY }}" http://localhost:3000/api/sessions/default || echo "{}")
+            echo "Attempt $i: $STATUS"
+            if echo "$STATUS" | grep -q '"WORKING"'; then
+              echo "WAHA is online, authenticated, and ready!"
               break
             fi
             sleep 3
