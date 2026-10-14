@@ -1,0 +1,82 @@
+name: Test WAHA and Ollama Pipeline
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 1. Decrypt GPG session archive
+      - name: Decrypt & Restore WAHA Session
+        run: |
+          mkdir -p waha_sessions
+          gpg --quiet --batch --yes --decrypt --passphrase "${{ secrets.SESSION_PASSPHRASE }}" \
+            --output session.tar.gz waha_session.enc
+          tar -xzf session.tar.gz -C waha_sessions
+          echo "Session files unpacked:"
+          ls -la waha_sessions
+
+      # 2. Boot WAHA Docker Container with WEBJS engine
+      - name: Start WAHA Docker Service
+        run: |
+          docker run -d \
+            --name waha \
+            -p 3000:3000 \
+            -v $(pwd)/waha_sessions:/app/.sessions \
+            -e WAHA_API_KEY="${{ secrets.WAHA_API_KEY }}" \
+            -e WHATSAPP_DEFAULT_ENGINE=WEBJS \
+            devlikeapro/waha
+
+          echo "Waiting for WAHA session to reach WORKING state..."
+          for i in {1..35}; do
+            STATUS=$(curl -s -H "X-Api-Key: ${{ secrets.WAHA_API_KEY }}" http://localhost:3000/api/sessions/default | grep -o '"status":"[^"]*"' || true)
+            echo "Check $i: $STATUS"
+            if [[ "$STATUS" == *"WORKING"* ]]; then
+              echo "WAHA is online and authenticated!"
+              break
+            fi
+            sleep 3
+          done
+
+      # 3. Install & Start Ollama
+      - name: Install & Start Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          
+          until curl -s http://localhost:11434 > /dev/null; do
+            echo "Waiting for Ollama daemon..."
+            sleep 2
+          done
+
+          echo "Pulling llama3.2:1b..."
+          ollama pull llama3.2:1b
+          echo "Ollama ready!"
+
+      # 4. Run Pipeline Script
+      - name: Run Pipeline
+        env:
+          OLLAMA_URL: "http://localhost:11434"
+          WAHA_URL: "http://localhost:3000"
+          WAHA_API_KEY: "${{ secrets.WAHA_API_KEY }}"
+          CHANNEL_ID: "${{ secrets.CHANNEL_ID }}"
+        run: |
+          node pipeline.js
+
+      # 5. Clean up Docker
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop waha || true
+          docker rm waha || true
